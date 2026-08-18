@@ -35,7 +35,7 @@ struct SourceMeta {
     }
 };
 
-EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
+EP_STATIC_ASSERT(sizeof(SourceMeta) == 2 * sizeof(int), "SourceMeta scalar access requires exactly two int fields");
 
 int get_source_meta_bytes() {
     return sizeof(SourceMeta);
@@ -62,7 +62,7 @@ std::pair<int, int> get_nvl_clean_meta(int hidden_int4, int num_scales, int num_
                                        int num_topk_weights, int num_rdma_ranks, int num_nvl_ranks,
                                        int num_nvl_recv_buffer_tokens, int num_channels, bool is_dispatch) {
     // Return `int32_t` offset and to clean
-    EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
+    EP_STATIC_ASSERT(sizeof(SourceMeta) == 2 * sizeof(int), "SourceMeta scalar access requires exactly two int fields");
 
     return {
         (num_nvl_recv_buffer_tokens * get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_nvl_ranks * num_channels) / sizeof(int),
@@ -566,9 +566,13 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             for (int i = 0; i < num_topk_ranks; ++ i)
                 dst_send_buffers[i] = reinterpret_cast<float*>(dst_send_buffers[i]) + num_scales;
 
-            // Copy source metadata into symmetric send buffer
-            if (lane_id < num_topk_ranks)
-                st_na_global(reinterpret_cast<SourceMeta*>(dst_send_buffers[lane_id]), src_meta);
+            // SourceMeta may be only 4-byte aligned after packed scales.
+            // Store its two int fields separately to avoid an unaligned 64-bit store.
+            if (lane_id < num_topk_ranks) {
+                auto meta_values = reinterpret_cast<int*>(dst_send_buffers[lane_id]);
+                st_na_global(meta_values, src_meta.src_rdma_rank);
+                st_na_global(meta_values + 1, src_meta.is_token_in_nvl_rank_bits);
+            }
             #pragma unroll
             for (int i = 0; i < num_topk_ranks; ++ i)
                 dst_send_buffers[i] = reinterpret_cast<SourceMeta*>(dst_send_buffers[i]) + 1;
@@ -782,7 +786,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++ i) {
                 auto rdma_slot_idx = i % num_max_rdma_chunked_recv_tokens;
                 auto shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_token;
-                auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes + scale_bytes));
+                auto src_meta_values = reinterpret_cast<const int*>(shifted + hidden_bytes + scale_bytes);
+                SourceMeta src_meta;
+                src_meta.src_rdma_rank = ld_nc_global(src_meta_values);
+                src_meta.is_token_in_nvl_rank_bits = ld_nc_global(src_meta_values + 1);
                 lane_id == src_rdma_rank ? (num_tokens_to_recv_from_rdma -= 1) : 0;
                 bool is_in_dst_nvl_rank = src_meta.is_token_in_nvl_rank(dst_nvl_rank);
                 if (lane_id == src_rdma_rank) {
@@ -929,7 +936,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++ chunk_idx, -- num_tokens_to_recv) {
                 int token_idx_in_buffer = (cached_channel_head_idx ++) % num_max_nvl_chunked_recv_tokens;
                 auto shifted = nvl_channel_x.buffer() + token_idx_in_buffer * num_bytes_per_token;
-                auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes + scale_bytes));
+                auto meta_values = reinterpret_cast<const int*>(shifted + hidden_bytes + scale_bytes);
+                SourceMeta meta;
+                meta.src_rdma_rank = ld_nc_global(meta_values);
+                meta.is_token_in_nvl_rank_bits = ld_nc_global(meta_values + 1);
                 int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank);
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
 

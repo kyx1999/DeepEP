@@ -38,6 +38,7 @@ if __name__ == '__main__':
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
     sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
     include_dirs = ['csrc/']
+    include_dirs.append('/usr/local/cuda/include/cccl')
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = []
